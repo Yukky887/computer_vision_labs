@@ -1,0 +1,7 @@
+tensorflow
+tensorflow-datasets
+numpy
+matplotlib
+scikit-learn
+Pillow
+importlib_resources
