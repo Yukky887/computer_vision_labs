@@ -1,0 +1,269 @@
+import os
+import cv2
+import numpy as np
+import urllib.request
+import matplotlib.pyplot as plt
+import pandas as pd
+
+# ==============================================================================
+# ШАГ 1. ЗАГРУЗКА ЭТАЛОННЫХ ИЗОБРАЖЕНИЙ ИЗ СТАБИЛЬНЫХ ИСТОЧНИКОВ
+# ==============================================================================
+print("--> Шаг 1: Загрузка тестовых эталонов...")
+
+URL_BARBARA = "url на рисунок"
+URL_STATUES = "url на рисунок"
+
+def download_file(url, filename):
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req) as response, open(filename, 'wb') as out_file:
+            out_file.write(response.read())
+        print(f"[УСПЕХ] Файл {filename} успешно загружен.")
+    except Exception as e:
+        print(f"[ОШИБКА] Не удалось скачать {filename}: {e}")
+
+download_file(URL_BARBARA, "Stonehenge.jpeg")
+download_file(URL_STATUES, "Toyota_Corolla_GT_AE86_Trueno_hatchback.jpg")
+
+img_barbara = cv2.imread("Stonehenge.jpeg", cv2.IMREAD_GRAYSCALE)
+img_statues = cv2.imread("Toyota_Corolla_GT_AE86_Trueno_hatchback.jpg", cv2.IMREAD_GRAYSCALE)
+
+# Резервная генерация на случай отсутствия сети
+if img_barbara is None: img_barbara = np.zeros((512, 512), dtype=np.uint8) + 128
+if img_statues is None: img_statues = np.zeros((500, 400), dtype=np.uint8) + 128
+
+img_barbara = cv2.resize(img_barbara, (512, 512))
+img_statues = cv2.resize(img_statues, (500, 400))
+
+# ==============================================================================
+# ВСПОМОГАТЕЛЬНЫЕ МАТЕМАТИЧЕСКИЕ ФУНКЦИИ
+# ==============================================================================
+def calculate_psnr(orig, filtered):
+    mse = np.mean((orig.astype(np.float64) - filtered.astype(np.float64)) ** 2)
+    if mse == 0: return float('inf')
+    return 20 * np.log10(255.0 / np.sqrt(mse))
+
+def calculate_rmse(gt, pred):
+    gt_norm = (gt > 0).astype(np.float64)
+    pred_norm = (pred > 0).astype(np.float64)
+    return np.sqrt(np.mean((gt_norm - pred_norm) ** 2))
+
+def add_gaussian_noise(image, sigma_sq=0.01):
+    img_normalized = image / 255.0
+    noise = np.random.normal(0, np.sqrt(sigma_sq), img_normalized.shape)
+    return np.clip((img_normalized + noise) * 255, 0, 255).astype(np.uint8)
+
+def add_salt_and_pepper_noise(image, p=0.2):
+    noisy_img = image.copy()
+    num_salt = np.ceil(p * image.size * 0.5)
+    coords = [np.random.randint(0, i - 1, int(num_salt)) for i in image.shape]
+    noisy_img[tuple(coords)] = 255
+    num_pepper = np.ceil(p * image.size * 0.5)
+    coords = [np.random.randint(0, i - 1, int(num_pepper)) for i in image.shape]
+    noisy_img[tuple(coords)] = 0
+    return noisy_img
+
+# ==============================================================================
+# ЗАДАНИЕ 1. ФИЛЬТРАЦИЯ И ДИНАМИЧЕСКИЙ ГРАФИК PSNR
+# ==============================================================================
+print("\n--> Задание 1: Запуск фильтрации...")
+
+def apply_6_filters(src_img, k_size=11, d_bilat=15, is_noisy=False):
+    k_blur = 7 if is_noisy else k_size
+    k_med = 5 if is_noisy else k_size
+    k_gauss = 7 if is_noisy else k_size
+    d_b = 9 if is_noisy else d_bilat
+
+    f_lf = cv2.blur(src_img, (k_blur, k_blur))
+    laplacian = cv2.Laplacian(src_img, cv2.CV_64F)
+    f_hf = cv2.convertScaleAbs(src_img.astype(np.float64) - laplacian)
+    f_avg = cv2.boxFilter(src_img, -1, (k_blur, k_blur))
+    f_med_res = cv2.medianBlur(src_img, k_med)
+    f_gauss_res = cv2.GaussianBlur(src_img, (k_gauss, k_gauss), 2 if is_noisy else 3)
+    f_bilat_res = cv2.bilateralFilter(src_img, d_b, 75, 75)
+
+    return [
+        ("НЧ (низкочастотный)", f_lf, f"маска {k_blur}x{k_blur}"),
+        ("ВЧ (высокочастотный)", f_hf, f"маска {5 if is_noisy else 11}x{5 if is_noisy else 11}"),
+        ("Усредняющий", f_avg, f"маска {k_blur}x{k_blur}"),
+        ("Медианный", f_med_res, f"маска {k_med}x{k_med}"),
+        ("Гауссово размытие", f_gauss_res, f"маска {k_gauss}x{k_gauss}, $\sigma$={'2' if is_noisy else '3'}"),
+        ("Билатеральный", f_bilat_res, f"d={d_b}, $\sigma$=75")
+    ]
+
+# 1.2 Незашумленное изображение (Рисунки 2–7)
+filters_clean = apply_6_filters(img_barbara, k_size=11, d_bilat=15, is_noisy=False)
+for idx, (name, res, params) in enumerate(filters_clean, start=2):
+    psnr_clean_val = calculate_psnr(img_barbara, res)
+    fig, axes = plt.subplots(1, 2, figsize=(8, 4), dpi=100)
+    axes[0].imshow(img_barbara, cmap='gray'); axes[0].set_title("Исходное изображение"); axes[0].axis('off')
+    axes[1].imshow(res, cmap='gray'); axes[1].set_title(f"{name}\n{params}\nPSNR = {psnr_clean_val:.2f} дБ"); axes[1].axis('off')
+    plt.suptitle(f"Рисунок {idx} – {name}")
+    plt.tight_layout(); plt.show()
+
+# 1.3 Зашумленное изображение (Рисунки 8–14)
+img_barbara_noisy = add_gaussian_noise(img_barbara, sigma_sq=0.01)
+plt.figure(figsize=(4, 4), dpi=100)
+plt.imshow(img_barbara_noisy, cmap='gray'); plt.title("Рисунок 8 – С гауссовым шумом ($\sigma^2=0,01$)"); plt.axis('off'); plt.show()
+
+filters_noisy = apply_6_filters(img_barbara_noisy, is_noisy=True)
+psnr_table_data, psnr_plot_labels, psnr_plot_values = [], [], []
+
+for idx, (name, res, params) in enumerate(filters_noisy, start=9):
+    psnr_val = calculate_psnr(img_barbara, res)
+    psnr_table_data.append([name, params.replace('$', ''), f"{psnr_val:.2f}"])
+
+    short_label = name.replace(" (низкочастотный)", "").replace(" (высокочастотный)", "").replace(" размытие", "")
+    psnr_plot_labels.append(f"{short_label}\n{params.replace('$', '')}")
+    psnr_plot_values.append(psnr_val)
+
+    fig, axes = plt.subplots(1, 2, figsize=(8, 4), dpi=100)
+    axes[0].imshow(img_barbara_noisy, cmap='gray'); axes[0].set_title("Зашумлённое ($\sigma^2=0,01$)"); axes[0].axis('off')
+    axes[1].imshow(res, cmap='gray'); axes[1].set_title(f"{name}\n{params}\nPSNR = {psnr_val:.2f} дБ"); axes[1].axis('off')
+    plt.suptitle(f"Рисунок {idx} – {name}")
+    plt.tight_layout(); plt.show()
+
+print("\nТаблица 1 – Значения PSNR фильтров при гауссовом шуме:")
+df_psnr = pd.DataFrame(psnr_table_data, columns=["Фильтр", "Параметры", "PSNR, дБ"])
+print(df_psnr.to_string(index=False))
+
+# --- ДИНАМИЧЕСКИЙ РИСУНОК 15 ---
+psnr_noisy = calculate_psnr(img_barbara, img_barbara_noisy)
+plt.figure(figsize=(11, 5), dpi=120)
+colors = ['#4472C4', '#ED7D31', '#70AD47', '#FFC000', '#B75A16', '#495666']
+bars = plt.bar(psnr_plot_labels, psnr_plot_values, color=colors, width=0.55)
+plt.axhline(y=psnr_noisy, color='r', linestyle='--', label=f'PSNR зашумл. ({psnr_noisy:.2f} дБ)')
+
+# Адаптивный расчет верхней границы оси Y
+max_psnr = max(max(psnr_plot_values), psnr_noisy)
+plt.ylim(0, max_psnr * 1.15)  # Запас 15% сверху под текстовые плашки
+
+plt.title("PSNR после фильтрации при гауссовом шуме $\sigma^2=0,01$", fontsize=12)
+plt.ylabel("PSNR (дБ)", fontsize=10)
+plt.grid(axis='y', linestyle='--', alpha=0.4)
+for bar in bars:
+    yval = bar.get_height()
+    plt.text(bar.get_x() + bar.get_width()/2, yval + (max_psnr * 0.02), f"{yval:.2f}", ha='center', fontweight='bold', fontsize=9)
+plt.legend()
+plt.suptitle("Рисунок 15 – Сравнение PSNR фильтров при гауссовом шуме", y=0.01, fontsize=11)
+plt.tight_layout(); plt.show()
+
+# 1.5 Импульсный шум (Рисунок 16, Таблица 2)
+p_levels = [0.2, 0.3, 0.4, 0.5]
+table_2_data = []
+fig, axes = plt.subplots(4, 2, figsize=(8, 12), dpi=100)
+for i, p in enumerate(p_levels):
+    noisy_sp = add_salt_and_pepper_noise(img_barbara, p=p)
+    med3 = cv2.medianBlur(noisy_sp, 3)
+    med5 = cv2.medianBlur(noisy_sp, 5)
+    p3 = calculate_psnr(img_barbara, med3)
+    p5 = calculate_psnr(img_barbara, med5)
+    table_2_data.append([f"p={p}", "Мед. 3х3", f"{p3:.2f}", "Мед. 5х5", f"{p5:.2f}"])
+    axes[i, 0].imshow(noisy_sp, cmap='gray'); axes[i, 0].set_title(f"Шум p={p}"); axes[i, 0].axis('off')
+    axes[i, 1].imshow(med3, cmap='gray'); axes[i, 1].set_title(f"Фильтр 3x3 (PSNR={p3:.2f} дБ)"); axes[i, 1].axis('off')
+plt.suptitle("Рисунок 16 – Медианная фильтрация при импульсном шуме")
+plt.tight_layout(); plt.show()
+
+print("\nТаблица 2 – PSNR медианного фильтра при импульсном шуме:")
+df_sp = pd.DataFrame(table_2_data, columns=["Шум", "3x3", "PSNR 3x3, дБ", "5x5", "PSNR 5x5, дБ"])
+print(df_sp.to_string(index=False))
+
+# ==============================================================================
+# ЗАДАНИЕ 2. КОНТУРЫ И ДИНАМИЧЕСКИЙ ГРАФИК СКО
+# ==============================================================================
+print("\n--> Задание 2: Запуск обнаружения контуров...")
+
+gt_edges = cv2.Canny(img_statues, 30, 120)
+img_statues_noisy = add_gaussian_noise(img_statues, sigma_sq=0.02)
+
+fig, axes = plt.subplots(1, 2, figsize=(8, 4), dpi=100)
+axes[0].imshow(img_statues, cmap='gray'); axes[0].set_title("Рисунок 17 – Исходное"); axes[0].axis('off')
+axes[1].imshow(gt_edges, cmap='gray'); axes[1].set_title("Рисунок 18 – Эталонная карта"); axes[1].axis('off')
+plt.tight_layout(); plt.show()
+
+def roberts_operator(img, threshold=150):
+    kx, ky = np.array([[1, 0], [0, -1]], dtype=np.float32), np.array([[0, 1], [-1, 0]], dtype=np.float32)
+    mag = cv2.magnitude(cv2.filter2D(img, cv2.CV_32F, kx), cv2.filter2D(img, cv2.CV_32F, ky))
+    return cv2.threshold(mag, threshold, 255, cv2.THRESH_BINARY)[1].astype(np.uint8)
+
+def previtt_operator(img, threshold=150):
+    kx = np.array([[1, 1, 1], [0, 0, 0], [-1, -1, -1]], dtype=np.float32)
+    ky = np.array([[-1, 0, 1], [-1, 0, 1], [-1, 0, 1]], dtype=np.float32)
+    mag = cv2.magnitude(cv2.filter2D(img, cv2.CV_32F, kx), cv2.filter2D(img, cv2.CV_32F, ky))
+    return cv2.threshold(mag, threshold, 255, cv2.THRESH_BINARY)[1].astype(np.uint8)
+
+def sobel_operator(img, threshold=150):
+    mag = cv2.magnitude(cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3))
+    return cv2.threshold(mag, threshold, 255, cv2.THRESH_BINARY)[1].astype(np.uint8)
+
+def log_operator(img, sigma=0.5, threshold=70):
+    lap = cv2.Laplacian(cv2.GaussianBlur(img, (5, 5), sigma), cv2.CV_32F)
+    return cv2.threshold(np.abs(lap), threshold, 255, cv2.THRESH_BINARY)[1].astype(np.uint8)
+
+def plot_edge_cases(src, title_prefix, start_fig_num, is_noise=False):
+    t_grad = 200 if is_noise else 150
+    sig_log = 2.0 if is_noise else 0.5
+    ops = [
+        ("Метод Робертса", roberts_operator(src, t_grad), f"порог = {t_grad}"),
+        ("Метод Превитта", previtt_operator(src, t_grad), f"порог = {t_grad}"),
+        ("Метод Собела", sobel_operator(src, t_grad), f"порог = {t_grad}"),
+        ("LoG", log_operator(src, sig_log, 70), f"$\sigma$={sig_log}, порог=70"),
+        ("Метод Кэнни", cv2.Canny(cv2.GaussianBlur(src, (5,5), 2.5).astype(np.uint8) if is_noise else src, 100 if is_noise else 50, 250 if is_noise else 200), "T1=100 T2=250 $\sigma$=2.5" if is_noise else "T1=50, T2=200, $\sigma$=1,5")
+    ]
+    for i, (name, res, params) in enumerate(ops):
+        fig_num = start_fig_num + i
+        rmse_val = calculate_rmse(gt_edges, res)
+        fig, axes = plt.subplots(1, 2, figsize=(8, 4), dpi=100)
+        axes[0].imshow(src, cmap='gray'); axes[0].set_title(title_prefix); axes[0].axis('off')
+        axes[1].imshow(res, cmap='gray'); axes[1].set_title(f"{name}\n{params}\nСКО = {rmse_val:.4f}"); axes[1].axis('off')
+        plt.suptitle(f"Рисунок {fig_num} – {name}")
+        plt.tight_layout(); plt.show()
+    return ops
+
+print("\n--> Вывод карт для чистого изображения:")
+ops_clean = plot_edge_cases(img_statues, "Исходное изображение", 19, is_noise=False)
+
+plt.figure(figsize=(4, 4), dpi=100)
+plt.imshow(img_statues_noisy, cmap='gray'); plt.title("Рисунок 24 – С гауссовым шумом $\sigma^2=0,02$"); plt.axis('off'); plt.show()
+
+print("\n--> Вывод карт для зашумленного изображения:")
+ops_noisy = plot_edge_cases(img_statues_noisy, "Зашумлённое ($\sigma^2=0,02$)", 25, is_noise=True)
+
+table_3_rows, names_list, rmse_clean_vals, rmse_noisy_vals = [], ["Робертса", "Превитта", "Собела", "LoG", "Кэнни"], [], []
+for i, name in enumerate(names_list):
+    c_rmse = calculate_rmse(gt_edges, ops_clean[i][1])
+    n_rmse = calculate_rmse(gt_edges, ops_noisy[i][1])
+    rmse_clean_vals.append(c_rmse)
+    rmse_noisy_vals.append(n_rmse)
+    table_3_rows.append([name, ops_clean[i][2].replace('$', ''), f"{c_rmse:.4f}", ops_noisy[i][2].replace('$', ''), f"{n_rmse:.4f}"])
+
+print("\nТаблица 3 – СКО операторов контурной детекции:")
+df_rmse = pd.DataFrame(table_3_rows, columns=["Оператор", "Парам.(чистое)", "СКО(чистое)", "Парам.(шум)", "СКО(шум)"])
+print(df_rmse.to_string(index=False))
+
+# --- ДИНАМИЧЕСКИЙ РИСУНОК 30 ---
+x = np.arange(len(names_list))
+width = 0.35
+
+plt.figure(figsize=(11, 5), dpi=120)
+plt.bar(x - width/2, rmse_clean_vals, width, label='Чистое изображение', color='#44A6F4')
+plt.bar(x + width/2, rmse_noisy_vals, width, label='Зашумлённое ($\sigma^2=0,02$)', color='#F15A5A')
+
+# Адаптивный расчет верхней границы оси Y на основе максимального СКО
+max_rmse = max(max(rmse_clean_vals), max(rmse_noisy_vals))
+plt.ylim(0, max_rmse * 1.15)  # Автоматический запас 15% под числовой текст
+
+plt.title("СКО по методам детектирования контуров", fontsize=12)
+plt.xticks(x, names_list, fontsize=10)
+plt.ylabel("СКО", fontsize=10)
+plt.grid(axis='y', linestyle='--', alpha=0.4)
+plt.legend()
+
+for i in range(len(names_list)):
+    plt.text(i - width/2, rmse_clean_vals[i] + (max_rmse * 0.02), f"{rmse_clean_vals[i]:.3f}", ha='center', fontsize=9)
+    plt.text(i + width/2, rmse_noisy_vals[i] + (max_rmse * 0.02), f"{rmse_noisy_vals[i]:.3f}", ha='center', fontsize=9)
+
+plt.suptitle("Рисунок 30 – Сравнение СКО операторов на чистом и зашумлённом изображениях", y=0.01, fontsize=11)
+plt.tight_layout(); plt.show()
+
+print("\n[УСПЕХ] Все расчеты завершены. Графики адаптированы!")
